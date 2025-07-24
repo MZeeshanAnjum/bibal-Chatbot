@@ -1,0 +1,174 @@
+# import os
+# from PyPDF2 import PdfReader
+# from langchain_ollama import OllamaEmbeddings
+# import chromadb
+
+
+# def embed_all_pdfs(
+#     pdf_dir: str,
+#     chroma_dir: str = "db/chroma_db",
+#     collection_name: str = "pdf_embeddings",
+# ):
+#     # 1) ensure ChromaDB folder exists
+#     os.makedirs(chroma_dir, exist_ok=True)
+
+#     # 2) init ChromaDB (persistent)
+#     client = chromadb.PersistentClient(path=chroma_dir)
+#     # drop old collection if it exists
+#     if collection_name in [c.name for c in client.list_collections()]:
+#         client.delete_collection(name=collection_name)
+#     collection = client.create_collection(name=collection_name)
+
+#     # 3) init Ollama embeddings
+#     embedder = OllamaEmbeddings(model="deepseek-r1")
+
+#     # 4) gather texts & filenames
+#     pdf_files = sorted(f for f in os.listdir(pdf_dir) if f.lower().endswith(".pdf"))
+#     print("Found PDFs:", pdf_files)
+
+#     texts, ids = [], []
+#     for fn in pdf_files:
+#         path = os.path.join(pdf_dir, fn)
+#         reader = PdfReader(path)
+#         text = "\n".join(page.extract_text() or "" for page in reader.pages)
+#         if not text.strip():
+#             print(f" {fn} is empty—skipping")
+#             continue
+#         texts.append(text)
+#         ids.append(fn)
+
+#     # 5) batch-embed
+#     print(f"\nEmbedding {len(texts)} documents…")
+#     embeddings = embedder.embed_documents(texts)
+
+#     # 6) store in ChromaDB
+#     for doc_id, text, emb in zip(ids, texts, embeddings):
+#         collection.add(
+#             documents=[text],
+#             embeddings=[emb],
+#             metadatas=[{"filename": doc_id}],
+#             ids=[doc_id],
+#         )
+#         print(f" Stored embedding for {doc_id}")
+
+#     print(f"\nDone. Total embeddings saved: {len(ids)}")
+
+
+# if __name__ == "__main__":
+#     embed_all_pdfs(pdf_dir=r"docs\pdf_files")
+
+import os
+from PyPDF2 import PdfReader
+import chromadb
+from transformers import AutoTokenizer, AutoModel
+import torch
+import torch.nn.functional as F
+
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = (
+        attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    )
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+        input_mask_expanded.sum(1), min=1e-9
+    )
+
+
+def chunk_text(text, chunk_size=256, overlap=32):
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i : i + chunk_size]
+        chunks.append(" ".join(chunk))
+        if i + chunk_size >= len(words):
+            break
+        i += chunk_size - overlap
+    return chunks
+
+
+def embed_texts(texts, tokenizer, model, batch_size=8, device="cpu"):
+    all_embeddings = []
+    model.to(device)
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        encoded_input = tokenizer(
+            batch, padding=True, truncation=True, return_tensors="pt", max_length=512
+        )
+        encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+        with torch.no_grad():
+            model_output = model(**encoded_input)
+        embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        all_embeddings.extend(embeddings.cpu().numpy())
+    return all_embeddings
+
+
+def embed_all_pdfs(
+    pdf_dir: str,
+    chroma_dir: str = "db/chroma_db",
+    collection_name: str = "pdf_embeddings",
+    chunk_size: int = 256,
+    overlap: int = 32,
+):
+    # 1) ensure ChromaDB folder exists
+    os.makedirs(chroma_dir, exist_ok=True)
+
+    # 2) init ChromaDB (persistent)
+    client = chromadb.PersistentClient(path=chroma_dir)
+    if collection_name in [c.name for c in client.list_collections()]:
+        client.delete_collection(name=collection_name)
+    collection = client.create_collection(name=collection_name)
+
+    # 3) init HF model & tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+    # 4) process PDFs
+    pdf_files = sorted(f for f in os.listdir(pdf_dir) if f.lower().endswith(".pdf"))
+    print("Found PDFs:", pdf_files)
+
+    chunk_texts, chunk_ids, chunk_metadatas = [], [], []
+    for fn in pdf_files:
+        path = os.path.join(pdf_dir, fn)
+        reader = PdfReader(path)
+        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        if not full_text.strip():
+            print(f" {fn} is empty—skipping")
+            continue
+        # Chunk the text
+        chunks = chunk_text(full_text, chunk_size=chunk_size, overlap=overlap)
+        for idx, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            chunk_id = f"{fn}__chunk_{idx}"
+            chunk_texts.append(chunk)
+            chunk_ids.append(chunk_id)
+            chunk_metadatas.append({"filename": fn, "chunk_index": idx})
+
+    # 5) batch-embed
+    print(f"\nEmbedding {len(chunk_texts)} chunks…")
+    embeddings = embed_texts(chunk_texts, tokenizer, model)
+
+    # 6) store in ChromaDB
+    for doc_id, text, emb, meta in zip(
+        chunk_ids, chunk_texts, embeddings, chunk_metadatas
+    ):
+        collection.add(
+            documents=[text],
+            embeddings=[emb],
+            metadatas=[meta],
+            ids=[doc_id],
+        )
+        print(f" Stored embedding for {doc_id}")
+
+    print(f"\nDone. Total embeddings saved: {len(chunk_ids)}")
+
+
+if __name__ == "__main__":
+    embed_all_pdfs(
+        pdf_dir=r"docs\pdf_files",
+        chunk_size=1500,
+        overlap=500,  # words overlap
+    )
